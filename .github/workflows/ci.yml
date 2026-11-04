@@ -1,0 +1,122 @@
+name: 1 - Continuous Integration
+run-name: "${{ github.workflow }}"
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/secure-coding-api
+
+jobs:
+  test:
+    name: Test REST API source code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run unit/API tests
+        run: |
+          python -m pytest -v tests                                                                         
+
+
+  sast:
+    name: Static security reports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - name: Install static analysis tools
+        run: python -m pip install bandit semgrep
+      - name: Record scan environment
+        run: |
+          mkdir -p reports
+          python --version > reports/python-version.txt
+          python -m pip freeze > reports/tool-environment.txt
+          bandit --version > reports/bandit-version.txt
+          semgrep --version > reports/semgrep-version.txt
+      - name: Bandit report
+        run: bandit baseline_secure_coding_api.py --exit-zero -f json -o reports/bandit.json
+      - name: Semgrep report
+        run: semgrep scan --config p/python --metrics=off --strict --json --output reports/semgrep.json baseline_secure_coding_api.py
+      - name: Preserve reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-analysis-reports
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30
+
+
+  build:
+    name: Build and test Docker image
+    runs-on: ubuntu-latest
+    needs: [test, sast]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image locally
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: secure-coding-api:${{ github.sha }}
+
+      - name: Run container
+        run: |
+          docker run -d \
+            --name secure-coding-api \
+            -p 5001:5001 \
+            secure-coding-api:${{ github.sha }}
+
+      - name: Smoke test container
+        run: |
+          sleep 5
+          curl --fail http://127.0.0.1:5001/
+
+      - name: Show container logs if needed
+        if: failure()
+        run: |
+          docker logs secure-coding-api
+
+      - name: Stop container
+        if: always()
+        run: |
+          docker stop secure-coding-api
+          docker rm secure-coding-api
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
