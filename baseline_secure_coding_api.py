@@ -61,6 +61,31 @@ def find_grade(student_id, course_id):
 
 
 # -----------------------------------------------------------------------------
+# Authorization helpers
+# -----------------------------------------------------------------------------
+
+def current_user():
+    """Resolve the session to the server-side user record on every request.
+
+    Only the username is taken from the session; role and course assignments
+    come from USERS, so stale or tampered session claims grant nothing.
+    """
+    username = flask.session.get("user")
+    if not isinstance(username, str):
+        return None
+    return USERS.get(username)
+
+
+def can_write_grade(user, course_id):
+    """R3: admins may write any grade; professors only their assigned courses."""
+    if user.role == "admin":
+        return True
+    if user.role == "professor":
+        return course_id in (user.courses or [])
+    return False  # students and any unknown role: deny by default
+
+
+# -----------------------------------------------------------------------------
 # REST API Endpoints
 # -----------------------------------------------------------------------------
 
@@ -127,11 +152,25 @@ def get_grades(student_id):
 
 @app.post("/grades/update")
 def update_grade():
-    data = flask.request.get_json()
+    # Return (body, status) tuples rather than flask.abort(): the catch-all
+    # errorhandler(Exception) below would turn an HTTPException into a 500.
+    user = current_user()
+    if user is None:
+        return {"error": "authentication required"}, 401
+
+    data = flask.request.get_json(silent=True)
+    if not isinstance(data, dict) or not {"student_id", "course_id", "grade"} <= data.keys():
+        return {"error": "invalid request"}, 400
 
     student_id = data["student_id"]
     course_id = data["course_id"]
     grade = data["grade"]
+    if not isinstance(course_id, str) or type(student_id) is not int:
+        return {"error": "invalid request"}, 400
+
+    # Checked before find_grade so the update and insert branches are both covered.
+    if not can_write_grade(user, course_id):
+        return {"error": "forbidden"}, 403
 
     row = find_grade(student_id, course_id)
     if row is None:
@@ -143,8 +182,27 @@ def update_grade():
 
 @app.get("/files")
 def download_file():
+    # R1: require a server-side user, same helper as /grades/update.
+    user = current_user()
+    if user is None:
+        return {"error": "authentication required"}, 401
+
+    # R6: canonicalise, then require the result to stay under MATERIALS_DIR.
+    # resolve() collapses '..' and follows symlinks; an absolute path replaces
+    # the base, which is_relative_to() then rejects. is_relative_to() compares
+    # path components, so a sibling such as 'materials-private' does not match.
+    # R7: one generic 404 for "outside", "missing", "not a file" and malformed
+    # input, so callers learn nothing about the filesystem and no path or
+    # exception text reaches the catch-all 500 handler.
+    not_found = {"error": "file not found"}, 404
     raw_path = flask.request.args.get("path", "")
-    target = MATERIALS_DIR / raw_path
+    base = pathlib.Path(MATERIALS_DIR).resolve()
+    try:
+        target = (base / raw_path).resolve()
+    except (OSError, RuntimeError, ValueError):  # e.g. NUL byte, symlink loop
+        return not_found
+    if not target.is_relative_to(base) or not target.is_file():
+        return not_found
     return flask.send_file(target)
 
 @app.errorhandler(Exception)
